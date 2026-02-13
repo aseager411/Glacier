@@ -1,0 +1,13 @@
+{
+    "type": "FeatureCollection",
+    "features": [
+      { "type": "Feature", "properties": {"name":"test_box"},
+        "geometry": { "type":"Polygon",
+          "coordinates":[[
+            [-73.4,-50.6],[-73.1,-50.6],[-73.1,-50.85],[-73.4,-50.85],[-73.4,-50.6]
+          ]]
+        }
+      }
+    ]
+  }
+  

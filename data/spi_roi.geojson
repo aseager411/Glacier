@@ -1,0 +1,26 @@
+
+{
+    "type": "FeatureCollection",
+    "name": "spi_bbox",
+    "features": [
+      {
+        "type": "Feature",
+        "properties": {
+          "name": "Southern Patagonian Icefield (BBox start)"
+        },
+        "geometry": {
+          "type": "Polygon",
+          "coordinates": [
+            [
+              [-73.656183, -48.806386],
+              [-71.966995, -48.806386],
+              [-71.966995, -51.004508],
+              [-73.656183, -51.004508],
+              [-73.656183, -48.806386]
+            ]
+          ]
+        }
+      }
+    ]
+  }
+  

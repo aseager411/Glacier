@@ -2,25 +2,42 @@
 """
 build_cache.py
 
-Heavy step (run only when preprocessing choices change):
-- Query Planetary Computer STAC for Landsat Collection 2 Level-2 scenes intersecting ROI
-- Stream only ROI pixels (COG window reads) for GREEN, SWIR1, QA_PIXEL
-- Mask clouds/shadows via QA_PIXEL bits
-- Compute per-scene NDSI
-- Write per-pixel median NDSI composite for each year to GeoTIFF cache
+Cache all reasonable Sentinel-2 late-summer scenes for each glacier polygon.
 
-Outputs (per year):
-  data/cache/ndsi_median_YYYY.tif
-  data/cache/ndsi_validcount_YYYY.tif   (optional QC)
+Workflow:
+- Read glacier polygons from ROI file
+- For each glacier and each year:
+    - Query Planetary Computer STAC for Sentinel-2 L2A scenes intersecting glacier
+    - Read GREEN, SWIR1, and SCL only over glacier window
+    - Build a glacier-polygon mask on the raster grid
+    - Mask cloud/shadow/bad pixels using SCL classes
+    - Compute NDSI
+    - Score scene by valid clear-pixel fraction inside glacier polygon
+    - Keep all scenes passing thresholds
+    - Write one NDSI GeoTIFF and one valid-mask GeoTIFF per accepted scene
+- Write a scene index CSV with metadata for all accepted scenes
+
+Outputs:
+  data/cache/<glacier_id>/<year>/ndsi_<date>_<itemid>.tif
+  data/cache/<glacier_id>/<year>/validmask_<date>_<itemid>.tif
+  data/cache/scene_index.csv
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Iterable, List
+
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
 
 import numpy as np
 import geopandas as gpd
+import pandas as pd
 import rasterio
+from rasterio.features import geometry_mask
 from rasterio.warp import transform_bounds
 from pystac_client import Client
 import planetary_computer as pc
@@ -29,10 +46,31 @@ import config as cfg
 
 
 # ----------------------------
+# Data structures
+# ----------------------------
+@dataclass
+class SceneScore:
+    glacier_id: str
+    year: int
+    item_id: str
+    date: str
+    cloud_cover: float
+    valid_fraction: float
+    n_valid: int
+    n_roi: int
+    ndsi_path: str = ""
+    validmask_path: str = ""
+    rgb_path: str = ""
+
+
+# ----------------------------
 # Helpers
 # ----------------------------
-def load_roi(roi_path: str) -> gpd.GeoDataFrame:
-    """Load ROI file, dissolve into a single geometry, ensure EPSG:4326."""
+def load_rois(roi_path: str) -> gpd.GeoDataFrame:
+    """
+    Load ROI file, repair minor invalid geometry, ensure EPSG:4326.
+    Keeps polygons separate. Creates glacier_id if none exists.
+    """
     gdf = gpd.read_file(roi_path)
     if gdf.empty:
         raise ValueError(f"ROI file has no features: {roi_path}")
@@ -42,17 +80,29 @@ def load_roi(roi_path: str) -> gpd.GeoDataFrame:
     else:
         gdf = gdf.to_crs("EPSG:4326")
 
-    # Fix minor invalid geometries and dissolve to one shape
     gdf["geometry"] = gdf.geometry.buffer(0)
-    geom = gdf.unary_union
-    return gpd.GeoDataFrame({"geometry": [geom]}, crs="EPSG:4326")
+    gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].copy()
+
+    for candidate in ["glacier_id", "name", "Name", "id", "ID"]:
+        if candidate in gdf.columns:
+            gdf["glacier_id"] = gdf[candidate].astype(str)
+            break
+    else:
+        gdf["glacier_id"] = [f"glacier_{i+1}" for i in range(len(gdf))]
+
+    return gdf[["glacier_id", "geometry"]].copy()
+
+
+def sanitize_id(s: str) -> str:
+    return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(s))
 
 
 def stac_search_items(catalog: Client, roi_geom, year: int) -> List:
-    """Search Landsat scenes for a given year+season window, intersecting ROI."""
+    """
+    Search Sentinel-2 L2A scenes for a given year+season window.
+    """
     dt = f"{year}-{cfg.START_MM_DD}/{year}-{cfg.END_MM_DD}"
 
-    # Prefer filtering by scene-level cloud cover metadata if supported.
     try:
         search = catalog.search(
             collections=[cfg.COLLECTION],
@@ -61,32 +111,37 @@ def stac_search_items(catalog: Client, roi_geom, year: int) -> List:
             query={"eo:cloud_cover": {"lt": cfg.MAX_CLOUD}},
             max_items=500,
         )
-        items = list(search.get_items())
+        items = list(search.items())
         if items:
             return items
     except Exception:
         pass
 
-    # Fallback: no cloud-cover query (still cloud-mask per pixel later)
     search = catalog.search(
         collections=[cfg.COLLECTION],
         intersects=roi_geom,
         datetime=dt,
         max_items=500,
     )
-    return list(search.get_items())
+    return list(search.items())
+
+
+def maybe_debug_subset(items: List) -> List:
+    if cfg.DEBUG_SORT_BY_CLOUD:
+        items = sorted(items, key=lambda it: it.properties.get("eo:cloud_cover", 999))
+    if cfg.DEBUG:
+        items = items[: cfg.DEBUG_MAX_SCENES]
+    return items
 
 
 def asset_has_common_name(asset, common_name: str) -> bool:
-    """Return True if this asset advertises eo:bands with the given common_name."""
     bands = asset.extra_fields.get("eo:bands") or []
     return any(b.get("common_name") == common_name for b in bands)
 
 
 def pick_band_asset(item, common_names: Iterable[str]) -> str:
     """
-    Choose an asset key by searching for eo:bands common_name values.
-    This avoids hard-coding Landsat band IDs across sensors.
+    Choose an asset key by eo:bands common_name.
     """
     for cn in common_names:
         for key, asset in item.assets.items():
@@ -95,112 +150,251 @@ def pick_band_asset(item, common_names: Iterable[str]) -> str:
     raise KeyError(f"No asset found with common_name in {list(common_names)} for item {item.id}")
 
 
-def read_window_as_array(asset_href: str, roi_bounds_wgs84, out_dtype=np.float32):
+def read_window_native(asset_href: str, roi_bounds_wgs84, out_dtype=np.float32):
     """
-    Stream-read only the window covering roi_bounds (WGS84) from a COG asset.
-    Returns: (array, profile)
+    Read ROI window in the asset's native grid.
+    Returns (array, profile).
     """
     with rasterio.open(asset_href) as src:
-        # Convert ROI bounds to the asset CRS, then compute a read window.
         bounds_src = transform_bounds("EPSG:4326", src.crs, *roi_bounds_wgs84, densify_pts=21)
         window = src.window(*bounds_src).round_offsets().round_lengths()
 
-        arr = src.read(1, window=window, boundless=True, fill_value=src.nodata).astype(out_dtype, copy=False)
+        arr = src.read(
+            1,
+            window=window,
+            boundless=True,
+            fill_value=src.nodata,
+        ).astype(out_dtype, copy=False)
 
         profile = src.profile.copy()
         profile.update(
             height=arr.shape[0],
             width=arr.shape[1],
             transform=src.window_transform(window),
+            crs=src.crs,
         )
         return arr, profile
 
 
-def qa_good_mask(qa_pixel: np.ndarray) -> np.ndarray:
-    """True where QA_PIXEL indicates usable (non-cloud/shadow/fill/cirrus) pixels."""
-    bad = cfg.BAD_BITS | (cfg.WATER if cfg.MASK_WATER else 0)
-    return (qa_pixel.astype(np.uint16) & bad) == 0
+def read_window_match_grid(
+    asset_href: str,
+    roi_bounds_wgs84,
+    ref_profile: dict,
+    out_dtype=np.float32,
+    resampling=Resampling.bilinear,
+):
+    """
+    Read an asset reprojected/resampled onto the reference grid.
+    """
+    with rasterio.open(asset_href) as src:
+        with WarpedVRT(
+            src,
+            crs=ref_profile["crs"],
+            transform=ref_profile["transform"],
+            width=ref_profile["width"],
+            height=ref_profile["height"],
+            resampling=resampling,
+        ) as vrt:
+            arr = vrt.read(1).astype(out_dtype, copy=False)
+
+    return arr
+
+
+def make_polygon_mask(geom_wgs84, out_profile) -> np.ndarray:
+    """
+    True inside glacier polygon, False outside, on raster grid.
+    """
+    geom_proj = gpd.GeoSeries([geom_wgs84], crs="EPSG:4326").to_crs(out_profile["crs"]).iloc[0]
+
+    mask = geometry_mask(
+        [geom_proj.__geo_interface__],
+        out_shape=(out_profile["height"], out_profile["width"]),
+        transform=out_profile["transform"],
+        invert=True,
+    )
+    return mask
+
+
+def sentinel_screen_mask(scl: np.ndarray) -> np.ndarray:
+    """
+    Conservative mask used only for scene scoring / acceptance.
+    """
+    bad_classes = {0, 1, 3, 8, 9, 10}
+
+    if getattr(cfg, "MASK_WATER", False):
+        bad_classes.add(6)
+
+    if getattr(cfg, "MASK_SNOW_ICE", False):
+        bad_classes.add(11)
+
+    good = np.ones_like(scl, dtype=bool)
+    for cls in bad_classes:
+        good &= (scl != cls)
+    return good
+
+
+def sentinel_compute_mask(scl: np.ndarray) -> np.ndarray:
+    """
+    Minimal mask used for NDSI computation itself.
+    Usually only exclude truly unusable pixels.
+    """
+    bad_classes = {0, 1}
+
+    good = np.ones_like(scl, dtype=bool)
+    for cls in bad_classes:
+        good &= (scl != cls)
+    return good
 
 
 def scale_sr(dn: np.ndarray) -> np.ndarray:
-    """Apply USGS Landsat C2 L2 surface reflectance scaling."""
-    return dn * cfg.SR_SCALE + cfg.SR_OFFSET
+    """
+    Sentinel-2 L2A reflectance scale.
+    """
+    return dn.astype(np.float32) * cfg.SR_SCALE
 
 
-def maybe_debug_subset(items: List) -> List:
-    """Optional speed-up: sort by cloud cover and keep only first N scenes."""
-    if cfg.DEBUG_SORT_BY_CLOUD:
-        items = sorted(items, key=lambda it: it.properties.get("eo:cloud_cover", 999))
-    if cfg.DEBUG:
-        items = items[: cfg.DEBUG_MAX_SCENES]
-    return items
+def score_scene_for_glacier(item, glacier_id: str, geom_wgs84, year: int):
+    """
+    Read one Sentinel-2 scene over one glacier polygon and return:
+      ndsi, valid_mask, rgb_stack, profile, score
+    """
+    roi_bounds = tuple(gpd.GeoSeries([geom_wgs84], crs="EPSG:4326").total_bounds)
+
+    red_key = pick_band_asset(item, common_names=["red"])
+    green_key = pick_band_asset(item, common_names=["green"])
+    blue_key = pick_band_asset(item, common_names=["blue"])
+    swir1_key = pick_band_asset(item, common_names=["swir16", "swir1"])
+
+    if "SCL" not in item.assets:
+        raise KeyError(f"SCL asset not found for item {item.id}")
+
+    red_href = item.assets[red_key].href
+    green_href = item.assets[green_key].href
+    blue_href = item.assets[blue_key].href
+    swir1_href = item.assets[swir1_key].href
+    scl_href = item.assets["SCL"].href
+
+    # Use SWIR1 native 20 m grid as the reference grid
+    swir1_dn, profile = read_window_native(swir1_href, roi_bounds, out_dtype=np.float32)
+
+    red_dn = read_window_match_grid(
+        red_href,
+        roi_bounds_wgs84=roi_bounds,
+        ref_profile=profile,
+        out_dtype=np.float32,
+        resampling=Resampling.bilinear,
+    )
+
+    green_dn = read_window_match_grid(
+        green_href,
+        roi_bounds_wgs84=roi_bounds,
+        ref_profile=profile,
+        out_dtype=np.float32,
+        resampling=Resampling.bilinear,
+    )
+
+    blue_dn = read_window_match_grid(
+        blue_href,
+        roi_bounds_wgs84=roi_bounds,
+        ref_profile=profile,
+        out_dtype=np.float32,
+        resampling=Resampling.bilinear,
+    )
+
+    scl = read_window_match_grid(
+        scl_href,
+        roi_bounds_wgs84=roi_bounds,
+        ref_profile=profile,
+        out_dtype=np.uint8,
+        resampling=Resampling.nearest,
+    )
+
+    inside = make_polygon_mask(geom_wgs84, profile)
+
+    screen_good = sentinel_screen_mask(scl)
+    compute_good = sentinel_compute_mask(scl)
+
+    red = scale_sr(red_dn)
+    green = scale_sr(green_dn)
+    blue = scale_sr(blue_dn)
+    swir1 = scale_sr(swir1_dn)
+
+    denom = green + swir1
+    ndsi = np.full_like(green, np.nan, dtype=np.float32)
+
+    # Conservative mask only for scene acceptance
+    screen_valid = inside & screen_good & np.isfinite(denom) & (np.abs(denom) > 1e-6)
+
+    # Minimal mask for actually computing NDSI
+    compute_valid = inside & compute_good & np.isfinite(denom) & (np.abs(denom) > 1e-6)
+    ndsi[compute_valid] = (green[compute_valid] - swir1[compute_valid]) / denom[compute_valid]
+
+    # RGB stack for later QC plotting
+    rgb = np.stack([red, green, blue], axis=0).astype(np.float32)
+
+    n_roi = int(np.sum(inside))
+    n_valid = int(np.sum(screen_valid))
+    valid_fraction = float(n_valid / n_roi) if n_roi > 0 else 0.0
+
+    scene_dt = item.datetime.isoformat() if item.datetime else "unknown"
+    cloud_cover = float(item.properties.get("eo:cloud_cover", np.nan))
+
+    score = SceneScore(
+        glacier_id=glacier_id,
+        year=year,
+        item_id=item.id,
+        date=scene_dt,
+        cloud_cover=cloud_cover,
+        valid_fraction=valid_fraction,
+        n_valid=n_valid,
+        n_roi=n_roi,
+    )
+
+    return ndsi, screen_valid, rgb, profile, score
 
 
-# ----------------------------
-# Main yearly builder
-# ----------------------------
-def build_year(catalog: Client, roi_gdf: gpd.GeoDataFrame, year: int) -> None:
-    cfg.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def is_scene_accepted(score: SceneScore) -> bool:
+    """
+    Accept a scene if enough glacier pixels are usable.
+    """
+    if score.n_roi == 0:
+        return False
+    if score.n_valid < cfg.MIN_ROI_PIXELS:
+        return False
+    if score.valid_fraction < cfg.MIN_VALID_FRACTION:
+        return False
+    return True
 
-    roi_geom = roi_gdf.geometry.iloc[0].__geo_interface__   # for STAC intersects
-    roi_bounds = tuple(roi_gdf.total_bounds)               # (minx, miny, maxx, maxy) in EPSG:4326
 
-    items = stac_search_items(catalog, roi_geom, year)
-    if not items:
-        print(f"[{year}] No scenes found for ROI/time window.")
-        return
+def write_scene_outputs(
+    glacier_id: str,
+    year: int,
+    item_id: str,
+    date_str: str,
+    ndsi: np.ndarray,
+    valid: np.ndarray,
+    rgb: np.ndarray,
+    profile: dict,
+) -> tuple[str, str, str]:
+    """
+    Write NDSI, valid-mask, and RGB rasters for one accepted scene.
+    """
+    glacier_dir = cfg.CACHE_DIR / sanitize_id(glacier_id) / str(year)
+    glacier_dir.mkdir(parents=True, exist_ok=True)
 
-    items = maybe_debug_subset(items)
+    safe_item = sanitize_id(item_id)
+    safe_date = date_str[:10] if len(date_str) >= 10 else sanitize_id(date_str)
 
-    # Sign items so asset hrefs are readable (adds a short-lived token if required).
-    items = [pc.sign(it) for it in items]
+    ndsi_path = glacier_dir / f"ndsi_{safe_date}_{safe_item}.tif"
+    valid_path = glacier_dir / f"validmask_{safe_date}_{safe_item}.tif"
+    rgb_path = glacier_dir / f"rgb_{safe_date}_{safe_item}.tif"
 
-    ndsi_stack = []
-    used = 0
-    profile = None
+    out_ndsi = np.where(np.isfinite(ndsi), ndsi, cfg.NODATA_FLOAT).astype(np.float32)
+    out_valid = valid.astype(np.uint8)
+    out_rgb = np.where(np.isfinite(rgb), rgb, cfg.NODATA_FLOAT).astype(np.float32)
 
-    for it in items:
-        try:
-            green_key = pick_band_asset(it, common_names=["green"])
-            swir1_key = pick_band_asset(it, common_names=["swir16", "swir1"])
-            qa_key = "QA_PIXEL"
-
-            green_href = it.assets[green_key].href
-            swir1_href = it.assets[swir1_key].href
-            qa_href = it.assets[qa_key].href
-
-            green_dn, profile = read_window_as_array(green_href, roi_bounds, out_dtype=np.float32)
-            swir1_dn, _ = read_window_as_array(swir1_href, roi_bounds, out_dtype=np.float32)
-            qa_pix, _ = read_window_as_array(qa_href, roi_bounds, out_dtype=np.uint16)
-
-            good = qa_good_mask(qa_pix)
-
-            green = scale_sr(green_dn)
-            swir1 = scale_sr(swir1_dn)
-
-            denom = green + swir1
-            ndsi = np.full_like(green, np.nan, dtype=np.float32)
-
-            valid = good & np.isfinite(denom) & (np.abs(denom) > 1e-6)
-            ndsi[valid] = (green[valid] - swir1[valid]) / denom[valid]
-
-            ndsi_stack.append(ndsi)
-            used += 1
-
-        except Exception as e:
-            print(f"[{year}] Skip item {it.id}: {e}")
-
-    if used == 0 or profile is None:
-        print(f"[{year}] No usable scenes after filtering.")
-        return
-
-    stack = np.stack(ndsi_stack, axis=0)  # (n_scenes, rows, cols)
-    ndsi_med = np.nanmedian(stack, axis=0).astype(np.float32)
-
-    out = np.where(np.isfinite(ndsi_med), ndsi_med, cfg.NODATA_FLOAT).astype(np.float32)
-
-    out_profile = profile.copy()
-    out_profile.update(
+    ndsi_profile = profile.copy()
+    ndsi_profile.update(
         driver="GTiff",
         dtype="float32",
         count=1,
@@ -209,38 +403,160 @@ def build_year(catalog: Client, roi_gdf: gpd.GeoDataFrame, year: int) -> None:
         tiled=True,
     )
 
-    out_path = cfg.CACHE_DIR / f"ndsi_median_{year}.tif"
-    with rasterio.open(out_path, "w", **out_profile) as dst:
-        dst.write(out, 1)
+    valid_profile = profile.copy()
+    valid_profile.update(
+        driver="GTiff",
+        dtype="uint8",
+        count=1,
+        compress=cfg.GTIFF_COMPRESS,
+        nodata=0,
+        tiled=True,
+    )
 
-    if cfg.WRITE_VALIDCOUNT:
-        validcount = np.sum(np.isfinite(stack), axis=0).astype(np.uint16)
+    rgb_profile = profile.copy()
+    rgb_profile.update(
+        driver="GTiff",
+        dtype="float32",
+        count=3,
+        compress=cfg.GTIFF_COMPRESS,
+        nodata=cfg.NODATA_FLOAT,
+        tiled=True,
+    )
 
-        vc_profile = profile.copy()
-        vc_profile.update(
-            driver="GTiff",
-            dtype="uint16",
-            count=1,
-            compress=cfg.GTIFF_COMPRESS,
-            nodata=0,
-            tiled=True,
+    with rasterio.open(ndsi_path, "w", **ndsi_profile) as dst:
+        dst.write(out_ndsi, 1)
+
+    with rasterio.open(valid_path, "w", **valid_profile) as dst:
+        dst.write(out_valid, 1)
+
+    with rasterio.open(rgb_path, "w", **rgb_profile) as dst:
+        dst.write(out_rgb)
+
+    return str(ndsi_path), str(valid_path), str(rgb_path)
+
+
+def process_one_glacier_one_year(
+    catalog: Client,
+    glacier_id: str,
+    geom_wgs84,
+    year: int,
+    rows: list[dict],
+) -> None:
+    """
+    Evaluate all scenes for one glacier-year and keep all that pass thresholds.
+    """
+    roi_geom = geom_wgs84.__geo_interface__
+    items = stac_search_items(catalog, roi_geom, year)
+
+    if not items:
+        print(f"[{glacier_id}][{year}] No scenes found.")
+        return
+
+    items = maybe_debug_subset(items)
+    items = [pc.sign(it) for it in items]
+
+    kept = 0
+
+    for it in items:
+        try:
+            ndsi, valid, rgb, profile, score = score_scene_for_glacier(it, glacier_id, geom_wgs84, year)
+
+            if not is_scene_accepted(score):
+                print(
+                    f"[{glacier_id}][{year}] reject {score.item_id} | "
+                    f"date={score.date[:10]} | cloud={score.cloud_cover:.1f}% | "
+                    f"valid_fraction={score.valid_fraction:.3f} "
+                    f"({score.n_valid}/{score.n_roi})"
+                )
+                continue
+
+            ndsi_path, valid_path, rgb_path = write_scene_outputs(
+                glacier_id=glacier_id,
+                year=year,
+                item_id=score.item_id,
+                date_str=score.date,
+                ndsi=ndsi,
+                valid=valid,
+                rgb=rgb,
+                profile=profile,
+            )
+
+            score.ndsi_path = ndsi_path
+            score.validmask_path = valid_path
+            score.rgb_path = rgb_path
+            rows.append(asdict(score))
+
+            kept += 1
+            print(
+                f"[{glacier_id}][{year}] keep   {score.item_id} | "
+                f"date={score.date[:10]} | cloud={score.cloud_cover:.1f}% | "
+                f"valid_fraction={score.valid_fraction:.3f} "
+                f"({score.n_valid}/{score.n_roi})"
+            )
+
+        except Exception as e:
+            print(f"[{glacier_id}][{year}] Skip item {it.id}: {e}")
+
+    if kept == 0:
+        print(f"[{glacier_id}][{year}] No acceptable scenes.")
+    else:
+        print(f"[{glacier_id}][{year}] Accepted {kept} scenes.")
+
+
+def write_scene_index(rows: list[dict]) -> None:
+    """
+    Write scene index CSV for all accepted scenes.
+    """
+    cfg.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    out_csv = cfg.CACHE_DIR / "scene_index.csv"
+
+    if rows:
+        df = pd.DataFrame(rows)
+        df = df.sort_values(["glacier_id", "year", "date", "item_id"]).reset_index(drop=True)
+    else:
+        df = pd.DataFrame(
+            columns=[
+                "glacier_id",
+                "year",
+                "item_id",
+                "date",
+                "cloud_cover",
+                "valid_fraction",
+                "n_valid",
+                "n_roi",
+                "ndsi_path",
+                "validmask_path",
+            ]
         )
-        vc_path = cfg.CACHE_DIR / f"ndsi_validcount_{year}.tif"
-        with rasterio.open(vc_path, "w", **vc_profile) as dst:
-            dst.write(validcount, 1)
 
-    msg = f"[{year}] Wrote {out_path.name} using {used} scenes"
-    if cfg.DEBUG:
-        msg += f" (DEBUG: max {cfg.DEBUG_MAX_SCENES})"
-    print(msg + ".")
+    df.to_csv(out_csv, index=False)
+    print(f"Wrote scene index: {out_csv}")
 
 
+# ----------------------------
+# Main
+# ----------------------------
 def main() -> None:
-    roi = load_roi(cfg.ROI_PATH)
+    rois = load_rois(cfg.ROI_PATH)
     catalog = Client.open(cfg.STAC_URL)
 
-    for year in range(cfg.START_YEAR, cfg.END_YEAR + 1):
-        build_year(catalog, roi, year)
+    cfg.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+
+    for _, row in rois.iterrows():
+        glacier_id = row["glacier_id"]
+        geom = row.geometry
+
+        for year in range(cfg.START_YEAR, cfg.END_YEAR + 1):
+            process_one_glacier_one_year(
+                catalog=catalog,
+                glacier_id=glacier_id,
+                geom_wgs84=geom,
+                year=year,
+                rows=rows,
+            )
+
+    write_scene_index(rows)
 
 
 if __name__ == "__main__":

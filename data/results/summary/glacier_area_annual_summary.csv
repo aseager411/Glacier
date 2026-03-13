@@ -1,0 +1,4 @@
+glacier_id,year,n_scenes,area_km2_min,area_km2_median,area_km2_max,valid_fraction_median
+de_monar,2024,2,37.8108,53.2098,68.6088,0.7162326097617634
+grey,2024,5,24.76,54.0556,61.0452,0.5095361793758758
+o'higgins,2024,5,19.3948,22.4836,47.1876,0.3628762197195289

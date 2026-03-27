@@ -7,16 +7,19 @@ import geopandas as gpd
 from datetime import datetime, timezone
 from pathlib import Path
 from shapely.geometry import box
+from scipy.stats import theilslopes, kendalltau
+
+gpd.options.io_engine = "fiona"
 
 
 GLACIER_NAMES_N_TO_S = [
-    "De Monar Glacier",
+    "Jorge Montt Glacier",
     "O'higgins Glacier",
     "Grey Glacier",
 ]
 
 GLACIER_COLORS = {
-    "De Monar": "tab:green",
+    "Jorge Montt Glacier": "tab:green",
     "O'higgins Glacier": "tab:orange",
     "Grey Glacier": "tab:purple",
 }
@@ -65,7 +68,7 @@ def load_and_name_glaciers(shapefile_path, target_crs):
     Load shapefile, reproject if needed, and assign glacier names
     by centroid latitude from north to south.
     """
-    gdf = gpd.read_file(shapefile_path)
+    gdf = gpd.read_file(shapefile_path, engine="fiona")
 
     if gdf.empty:
         raise ValueError(f"No features found in shapefile: {shapefile_path}")
@@ -188,6 +191,179 @@ def compute_glacier_timeseries(times, temp, precip, weights):
     return pd.DataFrame(records)
 
 
+def load_glacier_area_csv(csv_path):
+    """
+    Load glacier area measurements from CSV and convert to annual area series.
+
+    Expected columns:
+        GLACIER, AREA, DATE
+
+    Returns:
+        DataFrame with columns:
+            year, glacier_name, area_km2
+    """
+    df = pd.read_csv(csv_path)
+
+    required_cols = {"GLACIER", "AREA", "DATE"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Area CSV missing required columns: {missing}")
+
+    df = df.copy()
+    df = df.dropna(subset=["GLACIER", "AREA", "DATE"])
+
+    glacier_map = {
+        "GREY": "Grey Glacier",
+        "O´HIGGINS": "O'higgins Glacier",
+        "O'HIGGINS": "O'higgins Glacier",
+        "JORGE MONTT": "Jorge Montt Glacier",
+    }
+
+    df["GLACIER"] = df["GLACIER"].astype(str).str.strip().str.upper()
+    df["glacier_name"] = df["GLACIER"].map(glacier_map)
+
+    if df["glacier_name"].isna().any():
+        unknown = sorted(df.loc[df["glacier_name"].isna(), "GLACIER"].unique())
+        print(f"Warning: unrecognized glacier names in area CSV: {unknown}")
+
+    df = df.dropna(subset=["glacier_name"])
+
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df = df.dropna(subset=["DATE"])
+
+    df["year"] = df["DATE"].dt.year.astype(int)
+    df["area_km2"] = pd.to_numeric(df["AREA"], errors="coerce")
+    df = df.dropna(subset=["area_km2"])
+
+    area_df = (
+        df.groupby(["glacier_name", "year"], as_index=False)
+        .agg(area_km2=("area_km2", "mean"))
+        .sort_values(["glacier_name", "year"])
+    )
+
+    return area_df
+
+
+def load_gee_glacier_area_csv(csv_path):
+    """
+    Load glacier area output exported from Google Earth Engine.
+
+    Expected relevant columns:
+        box_name, year, glacier_area_m2
+
+    Notes:
+    - Keeps only year and area
+    - Collapses the 3 duplicate scene rows per glacier-year to one value
+    - Converts m^2 to km^2
+    """
+    df = pd.read_csv(csv_path)
+
+    required_cols = {"box_name", "year", "glacier_area_m2"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"GEE CSV missing required columns: {missing}")
+
+    df = df.copy()
+    df = df.dropna(subset=["box_name", "year", "glacier_area_m2"])
+
+    glacier_map = {
+        "DE_MONAR": "Jorge Montt Glacier",
+        "GREY": "Grey Glacier",
+        "O'HIGGINS": "O'higgins Glacier",
+    }
+
+    df["box_name"] = df["box_name"].astype(str).str.strip().str.upper()
+    df["glacier_name"] = df["box_name"].map(glacier_map)
+
+    if df["glacier_name"].isna().any():
+        unknown = sorted(df.loc[df["glacier_name"].isna(), "box_name"].unique())
+        print(f"Warning: unrecognized glacier names in GEE CSV: {unknown}")
+
+    df = df.dropna(subset=["glacier_name"])
+
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+    df["glacier_area_m2"] = pd.to_numeric(df["glacier_area_m2"], errors="coerce")
+    df = df.dropna(subset=["year", "glacier_area_m2"])
+
+    gee_area_df = (
+        df.groupby(["glacier_name", "year"], as_index=False)
+        .agg(glacier_area_m2=("glacier_area_m2", "mean"))
+        .sort_values(["glacier_name", "year"])
+    )
+
+    gee_area_df["year"] = gee_area_df["year"].astype(int)
+    gee_area_df["area_km2"] = gee_area_df["glacier_area_m2"] / 1e6
+
+    return gee_area_df[["glacier_name", "year", "area_km2"]]
+
+
+def scale_gee_area_to_legacy(legacy_area_df, gee_area_df):
+    """
+    Scale each glacier's GEE area series so that its first value (2019)
+    matches the last value from the legacy area series (assumed to be 2016).
+
+    Returns:
+        scaled GEE dataframe with columns:
+            glacier_name, year, area_km2
+    """
+    legacy_area_df = legacy_area_df.copy().sort_values(["glacier_name", "year"])
+    gee_area_df = gee_area_df.copy().sort_values(["glacier_name", "year"])
+
+    scaled_parts = []
+
+    for glacier_name in gee_area_df["glacier_name"].unique():
+        legacy_sub = legacy_area_df[legacy_area_df["glacier_name"] == glacier_name].sort_values("year")
+        gee_sub = gee_area_df[gee_area_df["glacier_name"] == glacier_name].sort_values("year").copy()
+
+        if legacy_sub.empty:
+            print(f"Warning: no legacy area data found for {glacier_name}; leaving GEE values unscaled.")
+            scaled_parts.append(gee_sub)
+            continue
+
+        if gee_sub.empty:
+            continue
+
+        legacy_anchor = legacy_sub.iloc[-1]["area_km2"]
+        gee_anchor = gee_sub.iloc[0]["area_km2"]
+
+        if not np.isfinite(legacy_anchor) or not np.isfinite(gee_anchor) or gee_anchor == 0:
+            print(f"Warning: could not scale GEE series for {glacier_name}; leaving values unscaled.")
+            scaled_parts.append(gee_sub)
+            continue
+
+        scale_factor = legacy_anchor / gee_anchor
+        gee_sub["area_km2"] = gee_sub["area_km2"] * scale_factor
+        scaled_parts.append(gee_sub)
+
+    if not scaled_parts:
+        return pd.DataFrame(columns=["glacier_name", "year", "area_km2"])
+
+    scaled_df = pd.concat(scaled_parts, ignore_index=True)
+    return scaled_df.sort_values(["glacier_name", "year"]).reset_index(drop=True)
+
+
+def combine_area_sources(legacy_area_df, gee_area_df_scaled):
+    """
+    Combine the original area series with the scaled GEE area series.
+    """
+    combined = pd.concat(
+        [
+            legacy_area_df[["glacier_name", "year", "area_km2"]],
+            gee_area_df_scaled[["glacier_name", "year", "area_km2"]],
+        ],
+        ignore_index=True,
+    )
+
+    combined = (
+        combined.dropna(subset=["glacier_name", "year", "area_km2"])
+        .drop_duplicates(subset=["glacier_name", "year"], keep="last")
+        .sort_values(["glacier_name", "year"])
+        .reset_index(drop=True)
+    )
+
+    return combined
+
+
 def get_placeholder_area_series(years, glacier_names):
     """
     Placeholder annual glacier area table.
@@ -222,6 +398,34 @@ def aggregate_to_annual(monthly_df):
     )
     return annual
 
+def compute_sen_slope_and_p(years, values):
+    """
+    Compute Sen's slope, intercept, and a two-sided p-value for monotonic trend.
+
+    Uses:
+    - Sen's slope via scipy.stats.theilslopes
+    - p-value via Kendall tau test
+
+    Returns:
+        slope, intercept, p_value
+    """
+    x = np.asarray(years, dtype=float)
+    y = np.asarray(values, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    if len(x) < 2:
+        return np.nan, np.nan, np.nan
+
+    if np.all(y == y[0]):
+        return 0.0, y[0], 1.0
+
+    slope, intercept, _, _ = theilslopes(y, x, alpha=0.95)
+    p_value = kendalltau(x, y).pvalue
+
+    return slope, intercept, p_value
 
 def plot_annual_grid(annual_df, save_path, area_df=None):
     """
@@ -236,7 +440,12 @@ def plot_annual_grid(annual_df, save_path, area_df=None):
     glacier_order = [g for g in GLACIER_NAMES_N_TO_S if g in annual_df["glacier_name"].unique()]
     years = np.sort(annual_df["year"].unique())
 
-    # compute common y-limits for each variable row
+    if area_df is None:
+        area_df = get_placeholder_area_series(years, glacier_order)
+
+    area_df = area_df.copy()
+    area_df = area_df.sort_values(["glacier_name", "year"])
+
     def safe_ylim(series, pad_frac=0.05):
         vals = np.asarray(series, dtype=float)
         vals = vals[np.isfinite(vals)]
@@ -254,16 +463,9 @@ def plot_annual_grid(annual_df, save_path, area_df=None):
 
         return (vmin - pad, vmax + pad)
 
-
     temp_ylim = safe_ylim(annual_df["temp_C"])
     precip_ylim = safe_ylim(annual_df["precip_mm"])
     area_ylim = safe_ylim(area_df["area_km2"])
-
-    if area_df is None:
-        area_df = get_placeholder_area_series(years, glacier_order)
-
-    area_df = area_df.copy()
-    area_df = area_df.sort_values(["glacier_name", "year"])
 
     fig, axes = plt.subplots(3, 3, figsize=(14, 10), sharex="col")
 
@@ -285,16 +487,79 @@ def plot_annual_grid(annual_df, save_path, area_df=None):
             else:
                 plot_df = area_sub
 
-            ax.plot(
-                plot_df["year"],
-                plot_df[var],
-                marker="o",
-                color=line_color,
-                linewidth=2,
-                markersize=4,
+            if var != "area_km2":
+                ax.plot(
+                    plot_df["year"],
+                    plot_df[var],
+                    marker="o",
+                    color=line_color,
+                    linewidth=2,
+                    markersize=4,
+                )
+            else:
+                legacy_area_sub = area_sub[area_sub["year"] <= 2016].sort_values("year")
+                gee_area_sub = area_sub[area_sub["year"] >= 2019].sort_values("year")
+
+                if not legacy_area_sub.empty:
+                    ax.plot(
+                        legacy_area_sub["year"],
+                        legacy_area_sub["area_km2"],
+                        marker="o",
+                        color=line_color,
+                        linewidth=2,
+                        markersize=4,
+                    )
+
+                if not gee_area_sub.empty:
+                    ax.plot(
+                        gee_area_sub["year"],
+                        gee_area_sub["area_km2"],
+                        marker="s",   # square marker for new GEE-based series
+                        color=line_color,
+                        linewidth=2,
+                        markersize=5,
+                    )
+
+
+            if var != "area_km2":
+                trend_years = plot_df["year"].values
+                trend_vals = plot_df[var].values
+            else:
+                trend_years = area_sub["year"].values
+                trend_vals = area_sub["area_km2"].values
+
+            slope, intercept, p_value = compute_sen_slope_and_p(trend_years, trend_vals)
+
+            if np.isfinite(slope) and np.isfinite(intercept):
+                x_trend = np.asarray(trend_years, dtype=float)
+                y_trend = slope * x_trend + intercept
+
+                ax.plot(
+                    x_trend,
+                    y_trend,
+                    linestyle="--",
+                    color="black",
+                    linewidth=1.5,
+                    alpha=0.8,
+                )
+
+            if np.isfinite(slope) and np.isfinite(p_value):
+                trend_text = f"Sen slope = {slope:.3f}\np = {p_value:.3f}"
+            else:
+                trend_text = "Sen slope = NA\np = NA"
+
+            ax.text(
+                0.03, 0.97,
+                trend_text,
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=9,
+                bbox=dict(facecolor="white", alpha=0.7, edgecolor="none")
             )
 
-            # enforce identical y-axis limits across glaciers
+
+
             if var == "temp_C" and temp_ylim is not None:
                 ax.set_ylim(temp_ylim)
             elif var == "precip_mm" and precip_ylim is not None:
@@ -327,8 +592,10 @@ def plot_annual_grid(annual_df, save_path, area_df=None):
 if __name__ == "__main__":
     repo_root = Path(__file__).resolve().parent
 
-    era_file = repo_root / "data" / "ERA" / "ERA5_SPI_monthly.grib"
+    era_file = repo_root / "data" / "ERA" / "ERA5_new.grib"
     shapefile = repo_root / "data" / "roi" / "spi_glaciers.shp"
+    area_csv = repo_root / "data" / "Glacier_Areas" / "SPI_Glacier_Areas.csv"
+    gee_area_csv = repo_root / "data" / "Glacier_Areas" / "spi_glacier_run0.csv"
 
     output_dir = repo_root / "outputs" / "era5_glacier_plots"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -338,15 +605,14 @@ if __name__ == "__main__":
 
     pixel_polygons = build_pixel_polygons(lats, lons, transform)
     glacier_weights = compute_glacier_weights(glaciers_gdf, pixel_polygons)
-    
+
     monthly_df = compute_glacier_timeseries(times, temp, precip, glacier_weights)
     annual_df = aggregate_to_annual(monthly_df)
 
-    # Placeholder annual area
-    area_df = get_placeholder_area_series(
-        years=np.sort(annual_df["year"].unique()),
-        glacier_names=[g for g in GLACIER_NAMES_N_TO_S if g in annual_df["glacier_name"].unique()],
-    )
+    legacy_area_df = load_glacier_area_csv(area_csv)
+    gee_area_df = load_gee_glacier_area_csv(gee_area_csv)
+    gee_area_df_scaled = scale_gee_area_to_legacy(legacy_area_df, gee_area_df)
+    area_df = combine_area_sources(legacy_area_df, gee_area_df_scaled)
 
     plot_annual_grid(
         annual_df,

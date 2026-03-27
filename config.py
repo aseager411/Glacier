@@ -42,8 +42,8 @@ END_YEAR = 2024
 
 # Seasonal window (late summer / minimum seasonal snow)
 # Adjust depending on hemisphere
-START_MM_DD = "02-01"
-END_MM_DD = "03-01"
+START_MM_DD = "02-24"
+END_MM_DD = "02-26"
 
 
 # ---------------------------------------------------
@@ -103,7 +103,7 @@ NODATA_FLOAT = -9999.0
 DEBUG = False
 
 # Maximum number of scenes processed per glacier/year in debug
-DEBUG_MAX_SCENES = 8
+DEBUG_MAX_SCENES = 30
 
 # Sort scenes by cloud cover before selecting debug subset
 DEBUG_SORT_BY_CLOUD = True
